@@ -6,66 +6,83 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 BASE_URL = "https://edikte.justiz.gv.at"
-LIST_URL = f"{BASE_URL}/edikte/ex/exedi3.nsf/suchedi?SearchView&subf=eex&SearchOrder=4&SearchMax=4999&query=([BL]=(5))"
+LIST_URL = "https://edikte.justiz.gv.at/edikte/ex/exedi3.nsf/suchedi?SearchView&subf=eex&SearchOrder=4&SearchMax=500&query=([BL]=(5))"
 
 def get_edikte():
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0"})
-    r = s.get(LIST_URL, timeout=20)
+    s.headers.update({"User-Agent": "Mozilla/5.0 Chrome"})
+    print("Lade Liste...")
+    r = s.get(LIST_URL, timeout=30)
     soup = BeautifulSoup(r.text, "lxml")
+
     ergebnisse = []
     for tr in soup.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 3:
-            continue
-        typ = tds[0].get_text(" ", strip=True)
-        adresse = tds[1].get_text(" ", strip=True)
         a = tr.find("a", href=True)
         if not a:
             continue
-        link = BASE_URL + a["href"] if a["href"].startswith("/") else a["href"]
-        if "Versteigerung" not in typ:
+        if "alldoc" not in a["href"] and "exedi3.nsf" not in a["href"]:
             continue
 
-        datum = ""
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+
+        full_text = tr.get_text(" ", strip=True)
+
+        # Datum
+        m_datum = re.search(r"(\d{2}\.\d{2}\.\d{4})", full_text)
+        datum = m_datum.group(1) if m_datum else ""
+
+        # Typ
+        if "Versteigerung" in full_text:
+            typ = "Versteigerung"
+        elif "Meistbot" in full_text:
+            typ = "Meistbotsverteilung"
+        elif "Verschiebung" in full_text:
+            typ = "Verschiebung"
+        else:
+            typ = full_text.split(" ")[0]
+
+        # Adresse = mittlere Spalte
+        adresse = tds[1].get_text(" ", strip=True) if len(tds) > 1 else full_text
+
+        # Link voll machen
+        href = a["href"]
+        if href.startswith("/"):
+            link = BASE_URL + href
+        else:
+            link = BASE_URL + "/edikte/ex/exedi3.nsf/" + href
+
+        # Nur Versteigerungen behalten? Wenn du alle willst, nächste 2 Zeilen löschen
+        if "Versteigerung" not in full_text:
+            continue
+
+        # Detail holen für Schätzwert + Fotos
         schaetzwert = "k.A."
         fotos = []
         try:
             d = s.get(link, timeout=15)
-            s_soup = BeautifulSoup(d.text, "lxml")
-            txt = s_soup.get_text(" ", strip=True)
+            d_soup = BeautifulSoup(d.text, "lxml")
+            txt = d_soup.get_text(" ", strip=True)
 
-            m_datum = re.search(r"(\d{2}\.\d{2}\.\d{4})", typ)
-            if m_datum:
-                datum = m_datum.group(1)
+            m = re.search(r"Schätzwert.*?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?\s*EUR)", txt, re.I)
+            if m:
+                schaetzwert = m.group(1)
+            else:
+                m2 = re.search(r"(\d{1,3}(?:\.\d{3})+,\d{2}\s*EUR)", txt)
+                if m2:
+                    schaetzwert = m2.group(1)
 
-            for pat in [r"Schätzwert.*?([\d\.\,]+\s*EUR)", r"Schätzwert.*?([\d\.\,]+)", r"Verkehrswert.*?([\d\.\,]+\s*EUR)"]:
-                m = re.search(pat, txt, re.I)
-                if m:
-                    schaetzwert = m.group(1)
-                    if "EUR" not in schaetzwert:
-                        schaetzwert += " EUR"
-                    break
+            for img in d_soup.find_all("a", href=True):
+                h = img["href"]
+                if any(x in h.lower() for x in [".jpg", ".pdf", ".png"]) or "foto" in img.get_text().lower() or "gutachten" in img.get_text().lower():
+                    full_f = BASE_URL + h if h.startswith("/") else h
+                    if "edikte" in full_f:
+                        fotos.append(full_f)
 
-            # FOTOS FINDEN
-            for img in s_soup.find_all("img", src=True):
-                src = img["src"]
-                if any(x in src.lower() for x in [".jpg", ".jpeg", ".png", "foto", "bild", "lichtbild"]):
-                    full_img = BASE_URL + src if src.startswith("/") else src
-                    if full_img.startswith("http"):
-                        fotos.append(full_img)
-
-            for link_tag in s_soup.find_all("a", href=True):
-                href = link_tag["href"]
-                text = link_tag.get_text().lower()
-                if any(x in href.lower() for x in [".jpg", ".jpeg", ".png", ".pdf"]) or any(x in text for x in ["foto", "bild", "gutachten", "lichtbild", "expose"]):
-                    full = BASE_URL + href if href.startswith("/") else href
-                    if full.startswith("http") and full not in fotos:
-                        fotos.append(full)
-
-            time.sleep(0.3)
+            time.sleep(0.4)
         except Exception as e:
-            print(f"Fehler {link}: {e}")
+            print(f"Detail Fehler: {e}")
 
         ergebnisse.append({
             "datum": datum,
@@ -73,10 +90,14 @@ def get_edikte():
             "adresse": adresse,
             "schaetzwert": schaetzwert,
             "link": link,
-            "fotos": ", ".join(fotos[:5]) if fotos else "keine Fotos" # max 5 Fotos
+            "fotos": ", ".join(fotos[:3]) if fotos else ""
         })
 
-    return list({e["link"]: e for e in ergebnisse}.values())
+    # Duplikate entfernen
+    uniq = {}
+    for e in ergebnisse:
+        uniq[e["link"]] = e
+    return list(uniq.values())
 
 def save_to_sheet(edikte):
     creds = Credentials.from_service_account_info(json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")), scopes=["https://www.googleapis.com/auth/spreadsheets"])
@@ -85,8 +106,9 @@ def save_to_sheet(edikte):
     vals = ws.get_all_values()
     if not vals:
         ws.append_row(["Datum", "Typ", "Adresse", "Schätzwert", "Link", "Fotos"])
-        vals = []
-    vorhanden = [row[4] if len(row)>4 else "" for row in vals]
+        vals = [ws.get_all_values()[0]]
+
+    vorhanden = [row[4] for row in vals if len(row) > 4]
     neu = []
     for e in edikte:
         if e["link"] not in vorhanden:
@@ -101,20 +123,23 @@ def send_email(neue):
     msg = MIMEMultipart()
     msg["From"] = os.getenv("EMAIL_FROM")
     msg["To"] = os.getenv("EMAIL_TO")
-    msg["Subject"] = f"{len(neue)} neue Versteigerungen Stmk mit Fotos"
-    body = ""
+    msg["Subject"] = f"🏠 {len(neue)} neue Versteigerungen Steiermark"
+    body = f"Hallo,\n\n{len(neue)} neue Versteigerungen in der Steiermark:\n\n"
     for n in neue:
-        body += f"{n['datum']} | {n['schaetzwert']}\n{n['adresse']}\n{n['link']}\nFotos: {n['fotos']}\n\n---\n\n"
+        body += f"📅 {n['datum']} | 💰 {n['schaetzwert']}\n📍 {n['adresse']}\n🔗 {n['link']}\n"
+        if n['fotos']:
+            body += f"📸 Fotos/Gutachten: {n['fotos']}\n"
+        body += "\n---\n\n"
+    body += "Liebe Grüße\nDein Edikte-Bot"
     msg.attach(MIMEText(body, "plain", "utf-8"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(os.getenv("EMAIL_FROM"), os.getenv("APP_PASSWORD"))
         server.send_message(msg)
+    print("Email gesendet")
 
 if __name__ == "__main__":
     ed = get_edikte()
-    print(f"{len(ed)} gefunden")
-    for e in ed[:2]:
-        print(e["adresse"], "| Fotos:", e["fotos"][:100])
+    print(f"{len(ed)} Versteigerungen gefunden")
     neue = save_to_sheet(ed)
-    print(f"{len(neue)} neu")
+    print(f"{len(neue)} neu ins Sheet")
     send_email(neue)
